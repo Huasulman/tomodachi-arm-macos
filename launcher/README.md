@@ -19,6 +19,15 @@ launcher/build.sh
 Compila la app y la deja en `/Applications/Tomodachi Launcher.app`, apuntando a este repo.
 Builds the app into `/Applications/Tomodachi Launcher.app`, pointing at this repository.
 
+Para un release | for a release:
+
+```bash
+launcher/build.sh --dist <carpeta | folder>
+```
+
+Crea `Tomodachi-Launcher-<versión>-arm64.zip` sin la ruta de tu Mac ni el icono del juego; al abrirlo por primera vez pide la carpeta del repo.
+Creates `Tomodachi-Launcher-<version>-arm64.zip` without your Mac's path or the game icon; on first launch it asks for the repo folder.
+
 ## Uso | Usage
 
 1. Arrastra el `.nsp` del juego base a la ventana (o pulsa **Elegir…**). | Drop the base game `.nsp` on the window (or press **Elegir…**).

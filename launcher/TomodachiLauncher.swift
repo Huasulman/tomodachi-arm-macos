@@ -1,5 +1,5 @@
-// Tomodachi Launcher: interfaz visual para scripts/build_tomodachi.sh | a GUI for scripts/build_tomodachi.sh
-// Eliges el .nsp (y prod.keys), pulsas Recompilar y ves cada paso con su registro.
+// Tomodachi Launcher：scripts/build_tomodachi.sh 的圖形介面；選好 .nsp（和 prod.keys），按「Recompilar」，逐步看進度和日誌
+// Tomodachi Launcher: a GUI for scripts/build_tomodachi.sh; pick the .nsp (and prod.keys), press Recompilar and follow each step with its log
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
@@ -23,7 +23,8 @@ struct LogLine: Identifiable {
     let text: String
 }
 
-/// Junta los bytes que llegan del proceso y los corta en líneas.
+/// 收集子程序的輸出位元組並切成行
+/// Collects the child process output bytes and splits them into lines
 final class LineSplitter {
     private var buffer = Data()
     func feed(_ data: Data) -> [String] {
@@ -83,14 +84,16 @@ final class Builder: ObservableObject {
         if let p = d.string(forKey: "keys"), FileManager.default.fileExists(atPath: p) {
             keys = URL(fileURLWithPath: p)
         } else if let r = root {
-            // prod.keys junto al repo o en la carpeta de arriba | next to the repo or one folder up
+            // prod.keys 放在倉庫裡或上一層目錄
+            // prod.keys next to the repo or one folder up
             for k in [r.appendingPathComponent("prod.keys"), r.deletingLastPathComponent().appendingPathComponent("prod.keys")]
             where FileManager.default.fileExists(atPath: k.path) { keys = k; break }
         }
         checkMetal()
     }
 
-    /// Lo mismo que comprueba build_tomodachi.sh: sin el compilador de Metal (Xcode) no hay shaders.
+    /// 與 build_tomodachi.sh 同樣的檢查：沒有 Metal 編譯器（Xcode）就編不了著色器
+    /// The same check as build_tomodachi.sh: without the Metal compiler (Xcode) there are no shaders
     func checkMetal() {
         DispatchQueue.global(qos: .userInitiated).async {
             let p = Process()
@@ -108,7 +111,8 @@ final class Builder: ObservableObject {
         NSWorkspace.shared.open(URL(string: "macappstore://apps.apple.com/app/id497799835")!)
     }
 
-    /// El script de compilación dentro de una carpeta: el del repo (scripts/) o uno suelto.
+    /// 目錄裡的構建腳本：倉庫的 scripts/ 或單獨放的一份
+    /// The build script inside a folder: the repo's scripts/ or a standalone copy
     static func script(in root: URL) -> URL? {
         for rel in ["scripts/build_tomodachi.sh", "build_tomodachi.sh"] {
             let u = root.appendingPathComponent(rel)
@@ -117,7 +121,8 @@ final class Builder: ObservableObject {
         return nil
     }
 
-    /// Carpeta del repo tomodachi-native (la que tiene scripts/build_tomodachi.sh).
+    /// tomodachi-native 倉庫目錄（有 scripts/build_tomodachi.sh 的那個）
+    /// The tomodachi-native repo folder (the one with scripts/build_tomodachi.sh)
     static func findRoot() -> URL? {
         var candidates: [String] = []
         if let p = UserDefaults.standard.string(forKey: "root") { candidates.append(p) }
@@ -183,7 +188,8 @@ final class Builder: ObservableObject {
         if log.count > 4000 { log.removeFirst(log.count - 4000) }
     }
 
-    /// Las líneas "== 3. Shaders ..." marcan el paso actual.
+    /// 「== 3. Shaders ...」這類行標出當前步驟
+    /// Lines like "== 3. Shaders ..." mark the current step
     static func stepNumber(_ line: String) -> Int? {
         guard line.hasPrefix("== "), line.count > 4 else { return nil }
         let c = line[line.index(line.startIndex, offsetBy: 3)]
@@ -208,7 +214,8 @@ final class Builder: ObservableObject {
         FileManager.default.createFile(atPath: launcherLog.path, contents: nil)
         logFile = try? FileHandle(forWritingTo: launcherLog)
 
-        // $1 = limpiar, $2 = script, $3 = nsp, $4 = keys (como argumentos, sin interpolar rutas)
+        // $1 = 清理、$2 = 腳本、$3 = nsp、$4 = keys（作為參數傳入，不把路徑拼進命令）
+        // $1 = clean, $2 = script, $3 = nsp, $4 = keys (passed as arguments, paths never spliced into the command)
         let wrapper = """
         W="$HOME/\(gameID)-work"
         if [ "$1" = 1 ]; then
@@ -239,7 +246,8 @@ final class Builder: ObservableObject {
         }
         p.terminationHandler = { [weak self] proc in
             let status = proc.terminationStatus
-            // Dar tiempo a que llegue lo último que quedó en la tubería.
+            // 等管道裡剩下的輸出讀完
+            // Give the last output left in the pipe time to arrive
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 pipe.fileHandleForReading.readabilityHandler = nil
                 let rest = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -305,7 +313,8 @@ final class Builder: ObservableObject {
     func cancel() {
         guard let p = process, p.isRunning else { return }
         cancelled = true
-        // build_tomodachi.sh lanza python, dotnet y make: hay que cerrar todo el árbol.
+        // build_tomodachi.sh 會起 python、dotnet 和 make：要結束整棵程序樹
+        // build_tomodachi.sh starts python, dotnet and make: the whole process tree has to go
         let pids = Builder.descendants(of: p.processIdentifier) + [p.processIdentifier]
         for pid in pids { kill(pid, SIGTERM) }
     }
@@ -334,7 +343,7 @@ final class Builder: ObservableObject {
     }
 }
 
-// MARK: - Vistas
+// MARK: - 視圖 | Views
 
 struct Card<Content: View>: View {
     let title: String
@@ -439,7 +448,8 @@ struct ContentView: View {
 
     private var filesCard: some View {
         Card(title: "Archivos") {
-            // Zona para soltar el .nsp
+            // 拖放 .nsp 的區域
+            // Drop zone for the .nsp
             HStack(spacing: 12) {
                 Image(systemName: b.nsp == nil ? "square.and.arrow.down" : "shippingbox.fill")
                     .font(.title2)

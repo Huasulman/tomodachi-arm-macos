@@ -1,8 +1,8 @@
 #!/bin/zsh
-# Uso | usage: scripts/build_tomodachi.sh <juego.nsp> <prod.keys>
-# Extrae el juego, reescribe su código, traduce los shaders, compila el host y crea la app en /Applications.
+# 用法 | usage: scripts/build_tomodachi.sh <遊戲.nsp | game.nsp> <prod.keys>
+# 解包遊戲、改寫代碼、翻譯著色器、編宿主，並在 /Applications 生成 App
 # Extracts the game, rewrites its code, translates the shaders, builds the host and creates the app in /Applications.
-# El .nsp (juego base v0) y prod.keys tienen que salir de tu propia consola; nunca van en el repo.
+# .nsp（基礎版 v0）和 prod.keys 必須來自你自己的主機，永遠不進倉庫
 # The .nsp (base game v0) and prod.keys must come from your own console; they never go in the repository.
 set -euo pipefail
 
@@ -10,7 +10,7 @@ NSP=${1:?Falta la ruta al NSP del juego base (v0) | missing path to the base gam
 KEYS=${2:?Falta la ruta a prod.keys | missing path to prod.keys}
 REPO=${0:A:h:h}
 
-# Entorno de Python: $TOMODACHI_VENV, .venv del repo o .venv de la carpeta de arriba
+# Python 環境：$TOMODACHI_VENV、倉庫的 .venv 或上一層目錄的 .venv
 # Python env: $TOMODACHI_VENV, the repo's .venv or a .venv one folder up
 VENV=${TOMODACHI_VENV:-}
 [ -z "$VENV" ] && [ -d "$REPO/.venv" ] && VENV=$REPO/.venv
