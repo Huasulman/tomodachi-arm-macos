@@ -37,7 +37,10 @@ DM_GAME=$G python3 dm/gfx/tools/shader_split.py $W/data/v0/RomFS $W/data/v0/ExeF
   dm/games/$G/shader_map.tsv dm/games/$G/shader_facts.tsv dm/games/$G/shader_pairs.tsv
 DM_GAME=$G python3 dm/gfx/tools/dmsh_chain.py --header
 DM_GAME=$G python3 dm/gfx/tools/dmsh_build.py $W/shader/pkg $W/build/cache/metal_shader_cache
-CHAIN=$(ls -d $W/build/cache/metal_shader_cache/b-* | head -1)
+# 取本源碼樹當前的鏈版本目錄（緩存裡可能留著舊鏈的目錄，不能按字母序挑）
+# Use the chain version directory of this source tree (the cache may still hold directories of older chains; never pick one alphabetically)
+CHAIN=$W/build/cache/metal_shader_cache/b-$(DM_GAME=$G python3 dm/gfx/tools/dmsh_chain.py)
+[ -d $CHAIN ] || { echo "【紅】找不到當前鏈的著色器目錄 | shader directory of the current chain not found: $CHAIN"; exit 1; }
 python3 dm/gfx/tools/c1_guard.py $CHAIN dm/games/$G/c1_full.tsv
 
 echo "== 4. Host y fuente"
