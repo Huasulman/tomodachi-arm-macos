@@ -48,7 +48,11 @@ static class SwshXlate
         public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
         public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
         public int QuerySamplerArrayLengthFromPool() => 32;
-        public int QueryTextureArrayLengthFromBuffer(int slot) => 32;
+        // 句柄放在 uniform 緩衝裡、按動態偏移取的貼圖數組：長度決定能取到的最大偏移（元素 e 在 8e 字節）。朋友收集的地面著色器按材質號取句柄（材質 × 256 + 272 起），
+        // 32 只夠到 256 字節：越界的索引被夾到 31，地面材質全讀到錯的貼圖（地面顏色隨視角變灰 / 藍）。1024 夠到 8 KB（材質 0–30）
+        // Texture arrays whose handles sit in a uniform buffer and are fetched at a dynamic offset: the length sets the largest reachable offset (element e at 8e bytes). Tomodachi Life's ground shader fetches handles by material id (from material × 256 + 272),
+        // and 32 only reaches 256 bytes: out-of-range indices were clamped to 31, so every ground material read the wrong texture (the ground turned grey / blue depending on the view). 1024 reaches 8 KB (materials 0–30)
+        public int QueryTextureArrayLengthFromBuffer(int slot) => 1024;
         public int QueryTextureArrayLengthFromPool() => 32;
 
         string Get(string table, int slot) => _job[table] is JsonObject t && t[slot.ToString()] is JsonNode n ? (n is JsonObject o ? (string)o["type"] : (string)n) : null;

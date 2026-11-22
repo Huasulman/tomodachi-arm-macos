@@ -21,7 +21,7 @@ enum { NVN_CT_FLOAT = 0, NVN_CT_UINT, NVN_CT_INT };                             
 #define NVN_REFL_MAXV 32
 // 參數緩衝槽上限（數組綁定把一項攤成多槽：朋友收集 GameField 的像素著色器 32 張貼圖 + 32 個採樣器的數組，到 69 槽）
 // Upper limit of argument buffer slots (an array binding spreads one entry over several slots: a Tomodachi Life GameField pixel shader has arrays of 32 textures + 32 samplers, reaching 69 slots)
-#define NVN_REFL_MAXA 256
+#define NVN_REFL_MAXA 4096   // 參數緩衝槽上限：句柄在 uniform 緩衝裡的貼圖 / 採樣器數組各 1024 個元素（dmsh_xlate） | argument-buffer slot limit: texture / sampler arrays with handles in a uniform buffer have 1024 elements each (dmsh_xlate)
 
 typedef struct {
     uint8_t kind, rw;        // rw：存儲緩衝 access 為 read_write / write / device | rw: storage buffer access is read_write / write / device
