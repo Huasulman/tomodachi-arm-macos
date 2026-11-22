@@ -8,7 +8,7 @@ HERE=${0:A:h}
 ROOT=${HERE:h}
 APP="/Applications/Tomodachi Launcher.app"
 GAME_APP="/Applications/Tomodachi Life.app"
-VERSION=1.0
+VERSION=1.1
 
 DIST=""
 if [ "${1:-}" = "--dist" ]; then
@@ -50,7 +50,7 @@ cat > "$L/Contents/Info.plist" <<EOF
   <key>CFBundleExecutable</key><string>TomodachiLauncher</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleVersion</key><string>2</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   $ROOT_KEY
