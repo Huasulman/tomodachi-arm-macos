@@ -118,6 +118,8 @@ HLE_FORCE("nvnBootstrapLoader", "NVN 圖形接口整塊換成宿主空設備（�
 #define B(x) ((x) & 0xff)
 
 #include "nvn_obj.h"
+static int async_pos(uint64_t *pos);
+static void submit_drain(void);   // 異步提交隊列清空（見 nvnQueueSubmitCommands） | the async submit queue drains (see nvnQueueSubmitCommands)
 
 // ---------- 設備 ----------
 // ---------- Device ----------
@@ -183,7 +185,7 @@ NVN(nvnMemoryPoolBuilderSetDefaults, void, NVNmemoryPoolBuilder *b) { memset(b, 
 NVN(nvnMemoryPoolBuilderSetDevice, void, NVNmemoryPoolBuilder *b, NVNdevice *d) { ((pool_builder_t *)b)->dev = d; }
 NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size_t n) { ((pool_builder_t *)b)->mem = m; ((pool_builder_t *)b)->size = n; }
 NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
-NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
+NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) { submit_drain();
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
     if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
@@ -192,7 +194,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
     return 1;
 }
-NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { if (((pool_t *)p)->mem && !(((pool_t *)p)->flags & 0x200)) {   // 虛擬池的存儲借自物理池，不退登記 | A virtual pool's storage is borrowed from a physical pool; do not unregister it
+NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { submit_drain(); if (((pool_t *)p)->mem && !(((pool_t *)p)->flags & 0x200)) {   // 虛擬池的存儲借自物理池，不退登記 | A virtual pool's storage is borrowed from a physical pool; do not unregister it
  nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); } mtl_alias_drop_pool(p); ((pool_t *)p)->magic = 0; }
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
@@ -202,12 +204,12 @@ NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { r
 NVN(nvnTexturePoolInitialize, NVNboolean, NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
     *(dpool_t *)tp = (dpool_t){(const pool_t *)p, off, n}; OLOG("TexturePool n=%d", n); mtl_set_tex_pool_n(n); return 1;
 }
-NVN(nvnTexturePoolFinalize, void, NVNtexturePool *tp) { (void)tp; }
+NVN(nvnTexturePoolFinalize, void, NVNtexturePool *tp) { submit_drain(); (void)tp; }
 NVN(nvnTexturePoolRegisterTexture, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) { (void)tp; mtl_reg_tex(id, (const tex_t *)t, (const view_t *)v); }
 NVN(nvnSamplerPoolInitialize, NVNboolean, NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
     *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n}; OLOG("SamplerPool n=%d", n); return 1;
 }
-NVN(nvnSamplerPoolFinalize, void, NVNsamplerPool *sp) { (void)sp; }
+NVN(nvnSamplerPoolFinalize, void, NVNsamplerPool *sp) { submit_drain(); (void)sp; }
 NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const NVNsampler *s) { (void)sp; mtl_reg_samp(id, &((const samp_t *)s)->p); }
 
 // ---------- 貼圖 ----------
@@ -275,6 +277,7 @@ static void pkg_copy(tex_t *o, const void *data) {
 }
 NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b) {
     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
+    if (o->magic == MAGIC('T', 'E', 'X', 0)) submit_drain();   // 就地重建仍有效的對象：排隊的回放可能還引用它；新對象不用等 | in-place re-init of a live object: queued replays may still reference it; a new object need not wait
     // 對仍有效的貼圖對象再初始化（沒先 Finalize）：先放掉舊序號的宿主貼圖。SMBW 的臨時渲染目標每幀在同一個對象上重新初始化、從不 Finalize，
     //   原先每次都新建一張私有 MTLTexture、舊的永遠留在序號表裡，顯卡內存每幀漲約 13 MB（24 GB 時被內存看門狗殺）
     // Re-initializing a texture object that is still live (without a Finalize first): release the host texture of the old serial first. SMBW re-initializes its transient render targets on the same object every frame and never Finalizes them;
@@ -291,7 +294,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
          o->d.levels, o->d.format, o->d.target, o->d.flags, o->L.size);
     return 1;
 }
-NVN(nvnTextureFinalize, void, NVNtexture *t) { mtl_tex_release(TX(t)); TX(t)->magic = 0; }
+NVN(nvnTextureFinalize, void, NVNtexture *t) { submit_drain(); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
 NVN(nvnTextureGetFlags, NVNtextureFlags, const NVNtexture *t) { return (NVNtextureFlags)CTX(t)->d.flags; }
 NVN(nvnTextureGetWidth, int, const NVNtexture *t) { return (int)CTX(t)->d.width; }
 NVN(nvnTextureGetHeight, int, const NVNtexture *t) { return (int)CTX(t)->d.height; }
@@ -337,10 +340,10 @@ static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r,
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
     mtl_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img);
 }
-NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst) {
+NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst) { submit_drain();
     read_texels(CTX(t), (const view_t *)v, r, dst, 0, 0);
 }
-NVN(nvnTextureReadTexelsStrided, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst, ptrdiff_t row, ptrdiff_t img) {
+NVN(nvnTextureReadTexelsStrided, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst, ptrdiff_t row, ptrdiff_t img) { submit_drain();
     read_texels(CTX(t), (const view_t *)v, r, dst, row, img);
 }
 NVN(nvnTextureInvalidateTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
@@ -373,7 +376,7 @@ NVN(nvnSamplerBuilderGetWrapMode, void, const NVNsamplerBuilder *b, NVNwrapMode 
 NVN(nvnSamplerInitialize, NVNboolean, NVNsampler *s, const NVNsamplerBuilder *b) {
     samp_t *o = (samp_t *)s; o->magic = MAGIC('S', 'M', 'P', 0); o->p = ((const samp_builder_t *)b)->p; return 1;
 }
-NVN(nvnSamplerFinalize, void, NVNsampler *s) { ((samp_t *)s)->magic = 0; }
+NVN(nvnSamplerFinalize, void, NVNsampler *s) { submit_drain(); ((samp_t *)s)->magic = 0; }
 
 // ---------- 程序 ----------
 // ---------- Programs ----------
@@ -381,7 +384,7 @@ NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
 static void pk_drop(const void *p);
-NVN(nvnProgramFinalize, void, NVNprogram *p) { mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; pk_drop(p); }
+NVN(nvnProgramFinalize, void, NVNprogram *p) { submit_drain(); mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; pk_drop(p); }
 // 程序的各階段鍵（旁表：客體 NVNprogram 地址 → 宿主對象；ok 第 i 位 = 第 i 階段已算） | a program's per-stage keys (side table: guest NVNprogram address → host object; bit i of ok = stage i computed)
 typedef struct { uint8_t key[6][8]; uint8_t ok; } prog_keys_t;
 static pthread_mutex_t g_pk_mu = PTHREAD_MUTEX_INITIALIZER; static CFMutableDictionaryRef g_pk;   // 專用表（不與別的旁表共用鍵） | a dedicated table (keys not shared with other side tables)
@@ -424,7 +427,7 @@ int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
     memcpy(key, k->key[st], 8);
     return 1;
 }
-NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
+NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) { submit_drain();
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("【紅】ProgramSetShaders 階段數 %d", n); return 0; }
     mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
@@ -446,10 +449,15 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
 // ---------- 同步 / 事件 ----------
 // ---------- Sync / events ----------
 NVN(nvnSyncInitialize, NVNboolean, NVNsync *s, NVNdevice *d) { (void)d; *(sync_t *)s = (sync_t){MAGIC('S', 'Y', 'N', 'C'), 0, 0}; return 1; }
-NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
+NVN(nvnSyncFinalize, void, NVNsync *s) { submit_drain(); ((sync_t *)s)->magic = 0; }
 // 圍欄 = 「此前提交到隊列的命令全部完成」：記下最近一次提交的柵欄值
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
-NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }
+// 異步提交時不等隊列：記下入隊序號（fenced = 2），等它時（sync_fence）再等回放越過這個位置、取那時的柵欄（只會偏晚，不會偏早）
+// With async submit it does not wait for the queue: it records the enqueue position (fenced = 2); waiting on it (sync_fence) then waits for replay to pass that position and takes the fence at that moment (only ever later, never earlier)
+static int sync_fence(const sync_t *o, int block, uint64_t *fence);
+NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f;
+    if (async_pos(&((sync_t *)s)->fence)) { ((sync_t *)s)->fenced = 2; return; }
+    ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }
 // 沒圍欄過的同步對象按真機行為等到超時；已圍欄的只在 GPU 真正完成到該柵欄值後放行
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
 // GPU 側等同步：宿主只有一條 Metal 隊列、提交按序執行，圍欄之前的命令必然先完成，不必等。尚未圍欄的同步對象（別的線程之後才圍欄）這裡不等，記一次
@@ -459,10 +467,11 @@ NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; stat
 NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
-    const sync_t *o = (const sync_t *)s;
+    const sync_t *o = (const sync_t *)s; uint64_t fence;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
-    if (mtl_wait(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
-    return mtl_wait(o->fence, timeout) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    if (!sync_fence(o, timeout != 0, &fence)) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;   // 輪詢（超時 0）時回放還沒到圍欄處 | polling (timeout 0) while replay has not reached the fence yet
+    if (mtl_wait(fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    return mtl_wait(fence, timeout) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
 NVN(nvnEventBuilderSetStorage, void, NVNeventBuilder *b, const NVNmemoryPool *p, int64_t off) { *(ev_builder_t *)b = (ev_builder_t){(const pool_t *)p, off}; }
@@ -472,7 +481,7 @@ NVN(nvnEventInitialize, NVNboolean, NVNevent *e, const NVNeventBuilder *b) {
     *(ev_t *)e = (ev_t){MAGIC('E', 'V', 'N', 'T'), (volatile uint32_t *)(s->pool->mem + s->off)}; return 1;
 }
 NVN(nvnEventFinalize, void, NVNevent *e) { ((ev_t *)e)->magic = 0; }
-NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { return *((const ev_t *)e)->val; }
+NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { submit_drain(); return *((const ev_t *)e)->val; }
 static void ev_signal(const ev_t *e, int mode, uint32_t v) { if (mode == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v; else *e->val = v; }
 NVN(nvnEventSignal, void, NVNevent *e, NVNeventSignalMode m, uint32_t v) { ev_signal((const ev_t *)e, m, v); }
 
@@ -500,12 +509,12 @@ NVN(nvnQueueInitialize, NVNboolean, NVNqueue *q, const NVNqueueBuilder *b) {
     *(queue_t *)q = (queue_t){MAGIC('Q', 'U', 'E', 'U'), ((const queue_builder_t *)b)->dev, 0};
     OLOG("QueueInitialize %p", (void *)q); return 1;
 }
-NVN(nvnQueueFinalize, void, NVNqueue *q) { ((queue_t *)q)->magic = 0; }
+NVN(nvnQueueFinalize, void, NVNqueue *q) { submit_drain(); ((queue_t *)q)->magic = 0; }
 NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *info) {
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; mtl_finish(); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { submit_drain(); (void)q; mtl_finish(); }
 
 // ---------- 命令緩衝：錄進遊戲的命令內存，提交時執行 CPU 可見副作用 ----------
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
@@ -918,6 +927,7 @@ __thread _Atomic int dm_host_work;   // 見 hle.h（定義在這裡：圖形單�
 static void gfx_enter(void) { pthread_mutex_lock(&g_susp_mu); while (g_susp) pthread_cond_wait(&g_susp_cv, &g_susp_mu); g_inflight_api++; pthread_mutex_unlock(&g_susp_mu); dm_host_work++; }
 static void gfx_leave(void) { dm_host_work--; pthread_mutex_lock(&g_susp_mu); g_inflight_api--; pthread_cond_broadcast(&g_susp_cv); pthread_mutex_unlock(&g_susp_mu); }
 void dm_gfx_suspend(int on) {
+    if (on) submit_drain();
     pthread_mutex_lock(&g_susp_mu);
     g_susp = on != 0;
     if (on) while (g_inflight_api) pthread_cond_wait(&g_susp_cv, &g_susp_mu);
@@ -931,8 +941,88 @@ void dm_gfx_suspend(int on) {
 // the replay layer's state (current command buffer, upload batch, submit thread) is one global copy, so whole submissions are serialized. Mario has a single submit thread, so this lock is never contended
 static pthread_mutex_t g_submit_mu = PTHREAD_MUTEX_INITIALIZER;
 static void submit_body(NVNqueue *q, int n, const NVNcommandHandle *h);
+// 異步提交（DM_NVN_ASYNC_SUBMIT，默認開；=0 回到在調用線程上同步回放）：朋友收集四條線程各自提交，回放整段串行，遠景時三條線程約一半時間排在提交鎖上，
+// CPU 與 GPU 都只忙一半。提交只把命令句柄拷進隊列就返回，專用回放線程按序回放（真機上提交也只是入隊、GPU 之後才讀命令）。
+// 與順序有關的接口（圍欄、等同步、Finish、出圖、取交換鏈貼圖、對象 Finalize / 就地重建、讀寫紋素、圖形掛起）先 submit_drain 等隊列清空，語義與同步回放相同。
+// 回放線程是唯一的「提交線程」（nvn_mtl.m 上傳批歸屬），棧 16 MB（Metal 驅動編內部程序要深棧）
+// Async submit (DM_NVN_ASYNC_SUBMIT, on by default; =0 goes back to replaying synchronously on the calling thread): Tomodachi Life submits from four threads and replay is fully serialized, so with a far camera three threads spent about half their time queued on the submit lock,
+// and both CPU and GPU were only half busy. A submit now only copies the command handles into a queue and returns; a dedicated replay thread replays them in order (on hardware a submit is only an enqueue too, and the GPU reads the commands later).
+// Order-dependent entry points (fences, sync waits, Finish, present, acquiring swapchain textures, object Finalize / in-place re-initialization, texel reads / writes, graphics suspend) first call submit_drain to wait for the queue to empty, so semantics match synchronous replay.
+// The replay thread is the only "submit thread" (owner of the upload batch in nvn_mtl.m), with a 16 MB stack (the Metal driver compiles internal programs on a deep stack)
+void *objc_autoreleasePoolPush(void); void objc_autoreleasePoolPop(void *);
+typedef struct { NVNqueue *q; int n; NVNcommandHandle *h; } sub_job;
+enum { SQ_N = 64 };
+static sub_job g_sq[SQ_N]; static uint64_t g_sq_head, g_sq_tail; static int g_sq_busy, g_async = -1;
+static pthread_mutex_t g_sq_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_sq_work = PTHREAD_COND_INITIALIZER, g_sq_done = PTHREAD_COND_INITIALIZER;
+static void *sq_main(void *arg) {
+    (void)arg; pthread_setname_np("nvn-submit");
+    // 回放線程也聲明時間約束（實時）：原先回放跑在出圖線程上、隨它享有實時策略；搬到這條普通優先級線程後，遠景每幀 10 ms CPU 的回放
+    // 被遊戲四十多條線程搶佔，牆鐘拉到 18 ms。週期按 60 FPS（16.67 ms），計算 12 ms，可搶佔
+    // The replay thread declares a time constraint (real-time) too: replay used to run on the present thread and shared its real-time policy; moved to this ordinary-priority thread, the far-camera replay of 10 ms CPU per frame
+    // was preempted by the game's forty-odd threads and stretched to 18 ms wall clock. Period for 60 FPS (16.67 ms), computation 12 ms, preemptible
+    { mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+      thread_time_constraint_policy_data_t tp = {.period = (uint32_t)(16666667ull * tb.denom / tb.numer), .computation = (uint32_t)(12000000ull * tb.denom / tb.numer),
+                                                 .constraint = (uint32_t)(16666667ull * tb.denom / tb.numer), .preemptible = 1};
+      kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&tp, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+      LOG("[nvn] 回放線程時間約束策略（週期 16.667 ms、計算 12 ms）%s", kr == KERN_SUCCESS ? "已設" : "設置失敗"); }
+    for (;;) {
+        pthread_mutex_lock(&g_sq_mu);
+        while (g_sq_head == g_sq_tail) pthread_cond_wait(&g_sq_work, &g_sq_mu);
+        sub_job j = g_sq[g_sq_head % SQ_N]; g_sq_busy = 1;
+        pthread_mutex_unlock(&g_sq_mu);
+        void *pool = objc_autoreleasePoolPush();
+        pthread_mutex_lock(&g_submit_mu); submit_body(j.q, j.n, j.h); pthread_mutex_unlock(&g_submit_mu);
+        objc_autoreleasePoolPop(pool);
+        free(j.h);
+        pthread_mutex_lock(&g_sq_mu); g_sq_head++; g_sq_busy = 0; pthread_cond_broadcast(&g_sq_done); pthread_mutex_unlock(&g_sq_mu);
+    }
+    return NULL;
+}
+static void sq_start(void) {
+    pthread_attr_t a; pthread_t t; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 16u << 20);
+    pthread_attr_set_qos_class_np(&a, QOS_CLASS_USER_INTERACTIVE, 0);
+    if (pthread_create(&t, &a, sq_main, NULL)) { g_async = 0; LOG("【紅】異步提交線程建不出，改同步回放"); }
+    else { pthread_detach(t); LOG("[nvn] 異步提交：開（DM_NVN_ASYNC_SUBMIT=0 關）"); }
+    pthread_attr_destroy(&a);
+}
+static int async_on(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    if (g_async < 0) { const char *e = getenv("DM_NVN_ASYNC_SUBMIT"); g_async = e ? atoi(e) != 0 : 1; }
+    if (g_async) pthread_once(&once, sq_start);
+    return g_async;
+}
+// 等異步提交隊列清空、回放線程閒下（同步模式下無事可做） | Wait until the async submit queue is empty and the replay thread is idle (nothing to do in synchronous mode)
+static void submit_drain(void) {
+    if (g_async <= 0) return;
+    pthread_mutex_lock(&g_sq_mu);
+    while (g_sq_head != g_sq_tail || g_sq_busy) pthread_cond_wait(&g_sq_done, &g_sq_mu);
+    pthread_mutex_unlock(&g_sq_mu);
+}
+// 異步提交開著時給出當前入隊位置（圍欄記它）；同步模式返回 0 | With async submit on, give the current enqueue position (the fence records it); returns 0 in synchronous mode
+static int async_pos(uint64_t *pos) {
+    if (g_async <= 0) return 0;
+    pthread_mutex_lock(&g_sq_mu); *pos = g_sq_tail; pthread_mutex_unlock(&g_sq_mu);
+    return 1;
+}
+// 同步對象的柵欄值：fenced = 2 時等回放越過記下的入隊位置（block = 0 不等，沒越過返回 0） | The sync's fence value: for fenced = 2, wait for replay to pass the recorded enqueue position (block = 0 does not wait and returns 0 if not passed yet)
+static int sync_fence(const sync_t *o, int block, uint64_t *fence) {
+    if (o->fenced != 2) { *fence = o->fence; return 1; }
+    pthread_mutex_lock(&g_sq_mu);
+    while (g_sq_head < o->fence) { if (!block) { pthread_mutex_unlock(&g_sq_mu); return 0; } pthread_cond_wait(&g_sq_done, &g_sq_mu); }
+    pthread_mutex_unlock(&g_sq_mu);
+    *fence = mtl_last_fence();
+    return 1;
+}
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
-    pthread_mutex_lock(&g_submit_mu); submit_body(q, n, h); pthread_mutex_unlock(&g_submit_mu);
+    if (!async_on()) { pthread_mutex_lock(&g_submit_mu); submit_body(q, n, h); pthread_mutex_unlock(&g_submit_mu); return; }
+    if (n <= 0) return;
+    NVNcommandHandle *c = malloc((size_t)n * sizeof *c); memcpy(c, h, (size_t)n * sizeof *c);
+    pthread_mutex_lock(&g_sq_mu);
+    while (g_sq_tail - g_sq_head >= SQ_N) pthread_cond_wait(&g_sq_done, &g_sq_mu);
+    g_sq[g_sq_tail % SQ_N] = (sub_job){q, n, c}; g_sq_tail++;
+    pthread_cond_signal(&g_sq_work);
+    pthread_mutex_unlock(&g_sq_mu);
 }
 static void submit_body(NVNqueue *q, int n, const NVNcommandHandle *h) {
     gfx_enter();
@@ -1043,7 +1133,7 @@ static uint64_t g_frame;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取圖裡節拍等待 / 等出圖隊列歸還的累計，出圖時按幀記（一幀內可有多次取圖） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主進程起點（main.c；UIMSG 時間戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
-NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
+NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) { submit_drain();
     win_t *o = (win_t *)w;
     *idx = o->ntex ? o->next++ % o->ntex : 0;
     // 垂直同步阻塞在這裡（真機 NVN：交換鏈裡的貼圖都在等顯示時，等下一張被釋放），不在出圖裡——遊戲常持鎖調出圖
@@ -1072,7 +1162,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
 }
 // 舊 API（NVN 53，超級馬力歐 3D 世界 + 狂怒世界）：取圖由隊列在 GPU 上等，不交同步對象。宿主按提交順序回放，之後的命令本來就排在此前出圖之後，同 WindowAcquireTexture 不帶同步對象（上游 42a50ef）
 // The older API (NVN 53, Super Mario 3D World + Bowser's Fury): the queue waits for the texture on the GPU and no sync object is handed out. The host replays in submission order, so later commands already come after earlier presents; the same as WindowAcquireTexture without a sync object (upstream 42a50ef)
-NVN(nvnQueueAcquireTexture, NVNqueueAcquireTextureResult, NVNqueue *q, NVNwindow *w, int *idx) {
+NVN(nvnQueueAcquireTexture, NVNqueueAcquireTextureResult, NVNqueue *q, NVNwindow *w, int *idx) { submit_drain();
     (void)q; return h_nvnWindowAcquireTexture(w, NULL, idx) == NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS ? (NVNqueueAcquireTextureResult)0 : (NVNqueueAcquireTextureResult)1;
 }
 
@@ -1301,7 +1391,7 @@ static uint64_t present_period(const win_t *o) {
     return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登記：讀取畫面此刻是否開著（diag.c 訂閱界面消息時填；圖形單測裡為空 = 不設閘） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
-NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
+NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) { submit_drain();
     (void)q; win_t *o = (win_t *)w; o->presents++;
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     // 第一次進局的讀取畫面：後台管線預熱沒跑完就在這裡等它（讀取畫面多停一會兒），進局後不在提交線程現編管線。預熱早已完成時一次判斷即過
@@ -1738,7 +1828,7 @@ static void write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r
     free(lin);
     mtl_tex_cpu_written(t);
 }
-NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) { write_texels(CTX(t), (const view_t *)v, r, src, 0, 0); }
+NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) { submit_drain(); write_texels(CTX(t), (const view_t *)v, r, src, 0, 0); }
 // 影片解碼器的原生貼圖輸出（DecoderMode 2，hle_movie.c）：整幀寫進客戶端貼圖第 0 級，同 WriteTexels；返回貼圖格式，對象不是貼圖返回 −1
 // The movie decoder's native-texture output (DecoderMode 2, hle_movie.c): a whole frame into level 0 of the client texture, as WriteTexels does; returns the texture format, or −1 when the object is not a texture
 int nvn_host_write_texture(const void *nvntex, const void *src, int w, int h, size_t row, int *tw, int *th) {

@@ -119,5 +119,6 @@ void dm_guest_write_prepare(void *addr, size_t len);
 // Graphics lifecycle (hle_nvn.c): on=1 suspends (afterwards submit / present block, and in-flight GPU work is drained before returning), on=0 resumes; called by the iOS front end when entering and leaving the background
 void dm_gfx_suspend(int on);
 void dm_gfx_shot_at(long k, const char *path);
+const char *dm_album_dir(void);   // 遊戲內存相簿的照片目錄（hle_sdk20.c；空串 = 沒有） | Directory of the photos the game saves to its album (hle_sdk20.c; empty string = none)
 void dm_shot_written(const char *path, int ok);   // 圖形側截圖寫盤完成（diag.c：DM_TICK_HOLD=E:SHOT 據此解凍） | The graphics side finished writing a screenshot to disk (diag.c: DM_TICK_HOLD=E:SHOT unfreezes on this)
 void dm_host_shutdown(const char *why);   // 優雅退出（crash.c）：停後台線程、音頻、圖形清空後 _exit(0)；SIGTERM 與 iOS App 終止回調用   // 圖形側：當前出圖幀之後第 k 幀截圖（nvn_mtl.m） | Graceful exit (crash.c): stop background threads and audio, drain graphics, then _exit(0); used by SIGTERM and the iOS App termination callback   // graphics side: screenshot of the k-th frame after the current presented frame (nvn_mtl.m)

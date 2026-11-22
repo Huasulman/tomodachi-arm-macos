@@ -4,6 +4,11 @@
 // Service interfaces newly imported by the SDK 20 generation (Tomodachi Life: Living the Dream, SDK 20.5.3). On hardware they all connect to system services through sm; the host has no service processes and takes them over by name.
 // Source: the undefined dynamic symbols of Tomodachi Life's main that the host did not hook yet (the survey's "imports vs host hooks", filtered to those that connect to a service through sm). Return conventions as in hle_offline.c:
 // "saved / submitted" kinds return RES_OK so the game does not retry; queries return values reasonable on a Switch; events get a bound SystemEvent that never fires.
+#include <ImageIO/ImageIO.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 #include "hle.h"
 
 // ---- oe ----
@@ -37,10 +42,46 @@ HLE_FORCE("_ZN2nn3ldn11SetProtocolENS0_8ProtocolE", "本地無線協議選擇；
 // ---- 相簿：遊戲內拍照存進系統相簿 | Album: in-game photos saved into the system album ----
 HLE_FORCE("_ZN2nn5album10InitializeEv", "相簿服務；宿主沒有，空操作", void, h_album_Init, void) {}
 HLE_FORCE("_ZN2nn5album8FinalizeEv", "相簿服務收尾", void, h_album_Fin, void) {}
-HLE_FORCE("_ZN2nn5album14SaveScreenshotEPKvmNS0_9ImageSizeENS0_17AlbumReportOptionE", "存截圖進相簿；宿主不存，報已保存（免得遊戲重試）", Result, h_album_Save,
-          const void *img, size_t sz, int isz, int opt) {
-    static int n; if (n++ < 4) LOG("album::SaveScreenshot %zu 字節（圖像尺寸 %d，選項 %d）：宿主不存", sz, isz, opt);
-    (void)img; return RES_OK;
+// 相簿目錄：$DM_ALBUM，否則存檔目錄旁的 album/（Mac：Application Support/nxnative/<id>/album）；前端「Extras」菜單從這裡列照片
+// Album directory: $DM_ALBUM, otherwise album/ next to the save directory (Mac: Application Support/nxnative/<id>/album); the front end's "Extras" menu lists the photos from here
+const char *dm_album_dir(void) {
+    static char dir[1100];
+    if (dir[0]) return dir;
+    const char *a = getenv("DM_ALBUM"), *s = getenv("DM_SAVE");
+    if (a && *a) strlcpy(dir, a, sizeof dir);
+    else if (s && *s) {
+        strlcpy(dir, s, sizeof dir); size_t L = strlen(dir); while (L > 1 && dir[L - 1] == '/') dir[--L] = 0;
+        char *sl = strrchr(dir, '/'); if (sl) sl[1] = 0; else dir[0] = 0;
+        strlcat(dir, "album", sizeof dir);
+    }
+    return dir;
+}
+// 圖像是線性 RGBA8（album::ImageSize 只有 0 = 1280x720；字節數對不上就按它推 16:9），存成 PNG（不帶透明：Switch 相簿是 JPEG、無 alpha）。
+// 跑在宿主大棧上：調用的「Save Album Thread」棧小，PNG 編碼要幾十 KB 棧
+// The image is linear RGBA8 (album::ImageSize only has 0 = 1280x720; when the size does not match, 16:9 is inferred from the byte count), saved as PNG (no transparency: the Switch album is JPEG with no alpha).
+// Runs on the big host stack: the calling "Save Album Thread" has a small stack and PNG encoding needs tens of KB of it
+HLE_FORCE_BIG("_ZN2nn5album14SaveScreenshotEPKvmNS0_9ImageSizeENS0_17AlbumReportOptionE", "存截圖進相簿：宿主寫成 PNG 進相簿目錄", Result, h_album_Save,
+              const void *img, size_t sz, int isz, int opt) {
+    // 緩衝按 256 KB 向上取整（1280x720 → 0x3c0000 字節），像素在開頭、行距 = 寬 x 4 | the buffer is rounded up to 256 KB (1280x720 -> 0x3c0000 bytes), the pixels sit at the start with a row pitch of width x 4
+    size_t w = 1280, h = 720;
+    if (sz < w * h * 4 || sz >= w * h * 4 + (256u << 10)) { w = 0; for (size_t t = 16; t * t * 9 * 4 / 16 <= sz; t += 16) if (t * (t * 9 / 16) * 4 == sz) w = t; h = w * 9 / 16; }
+    const char *dir = dm_album_dir();
+    if (!img || !w || !dir[0]) { LOG("【紅】album::SaveScreenshot %zu 字節（圖像尺寸 %d，選項 %d）：認不出尺寸或沒有相簿目錄，不存", sz, isz, opt); return RES_OK; }
+    mkdir(dir, 0755);
+    time_t now = time(NULL); struct tm tm; localtime_r(&now, &tm);
+    char path[1200], stamp[32]; strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
+    snprintf(path, sizeof path, "%s/Tomodachi-%s.png", dir, stamp);
+    for (int k = 2; access(path, F_OK) == 0 && k < 100; k++) snprintf(path, sizeof path, "%s/Tomodachi-%s-%d.png", dir, stamp, k);
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, img, w * h * 4, NULL);
+    CGImageRef im = CGImageCreate(w, h, 8, 32, w * 4, cs, (CGBitmapInfo)kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault, dp, NULL, false, kCGRenderingIntentDefault);
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, (CFIndex)strlen(path), false);
+    CGImageDestinationRef d = url && im ? CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL) : NULL;
+    int ok = 0; if (d) { CGImageDestinationAddImage(d, im, NULL); ok = CGImageDestinationFinalize(d); CFRelease(d); }
+    if (url) CFRelease(url); if (im) CGImageRelease(im); CGDataProviderRelease(dp); CGColorSpaceRelease(cs);
+    if (ok) LOG("album::SaveScreenshot %zux%zu → %s", w, h, path);
+    else LOG("【紅】album::SaveScreenshot 寫 PNG 失敗：%s", path);
+    return RES_OK;
 }
 
 // ---- 遙測（prepo） | Telemetry (prepo) ----

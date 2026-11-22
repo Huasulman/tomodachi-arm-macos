@@ -97,7 +97,11 @@ _nvn_big_entry:
     adrp x17, _nvn_big_real@PAGE
     add x17, x17, _nvn_big_real@PAGEOFF
     ldr x16, [x17, x16, lsl #3]
-    b _dm_bigstack_enter
+    // 經 GOT 跳：直接 b 會被匯編器綁到本文件下面的弱定義（只 br x16、不換棧），鏈接器再也換不成宿主的強定義，NVN 就全跑在客體棧上（存相冊線程棧小，提交時溢出崩潰）
+    // Jump through the GOT: a direct b gets bound by the assembler to the weak definition below in this file (a bare br x16 with no stack switch), the linker can then no longer swap in the host's strong one, and all of NVN runs on guest stacks (the save-album thread's small stack overflows on submit)
+    adrp x17, _dm_bigstack_enter@GOTPAGE
+    ldr x17, [x17, _dm_bigstack_enter@GOTPAGEOFF]
+    br x17
 
 // 弱定義的大棧入口：不換棧，直接跳到實現。宿主裡由 dm/host/hle_bigstack.c 的強定義蓋過；圖形單測不編宿主那份，鏈接這份（單測不在客體棧上跑）
 // Weak big-stack entry: no stack switch, jumps straight to the implementation. In the host the strong definition in dm/host/hle_bigstack.c wins; the graphics unit tests do not build that file and link this one (they never run on a guest stack)

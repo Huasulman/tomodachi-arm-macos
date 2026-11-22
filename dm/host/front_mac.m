@@ -25,11 +25,17 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
+#import <GameController/GameController.h>
+#import <IOUSBHost/IOUSBHost.h>
+#include <os/lock.h>
 #include "dm.h"
 #include "dm_input.h"
+#include "dm_padmap.h"
 #include "dm_bind.h"
 #include "dm_uiscreen.h"
 #include "dm_aspect.h"
+#include "controls_mac.h"
+#include "album_mac.h"
 void mtl_set_ui_rect_fn(void (*fn)(double *y, double *h));
 static void ui_rect_frac(double *fy, double *fh) { int x, y, w, h, rw = 0, rh = 0; dm_ui_rect(&x, &y, &w, &h); if (dm_screen_real(&rw, &rh) && rh > 0) { *fy = (double)y / rh; *fh = (double)h / rh; } }   // 同 front_ios.m：界面矩形的縱向位置與高（佔畫面高的比例） | Same as front_ios.m: vertical position and height of the UI rectangle (as fractions of the frame height)
 __attribute__((constructor)) static void ui_shift_reg(void) { mtl_set_ui_rect_fn(ui_rect_frac); }   // 不開窗口的跑法（截圖 / 閘門）也要生效，所以不放在建圖層那裡 | Must also take effect when running without a window (screenshots / gate checks), so it is not placed where the layer is created
@@ -70,59 +76,69 @@ uint64_t front_game_res(int docked) {
 }
 static NSSize picture_size(void) { uint64_t r = front_game_res(1); return NSMakeSize((uint32_t)r, (uint32_t)(r >> 32)); }   // 遊戲輸出的形狀（寬、高） | the shape of the game's output (width, height)
 
-// ---------- 界面文字（英文 / 繁體中文，按系統首選語言） | Interface text (English / Traditional Chinese, by the system's preferred language) ----------
+// ---------- 界面文字（英文 / 繁體中文 / 西班牙文，按系統首選語言） | Interface text (English / Traditional Chinese / Spanish, by the system's preferred language) ----------
 enum { T_ABOUT, T_EDIT_CONTROLS, T_HIDE, T_HIDE_OTHERS, T_SHOW_ALL, T_QUIT, T_EDIT, T_UNDO, T_REDO, T_CUT, T_COPY, T_PASTE, T_SELECT_ALL,
        T_GAME, T_PAUSE, T_RESUME, T_SHOT, T_SAVES, T_VIEW, T_FULL, T_WINDOW, T_MIN, T_ZOOM, T_FRONT, T_HELP, T_CONTROLS, T_LOG,
        T_HINT_CLICK, T_HINT_CMD, T_PAUSED, T_QUIT_Q, T_QUIT_INFO, T_QUIT_OK, T_OK, T_CANCEL, T_INPUT, T_SHOT_SAVED,
-       T_SAVE_FAIL, T_SAVE_SPACE, T_SAVE_OTHER, T_CONTROLS_MOUSE, T_CONTROLS_TAP, T_CONTROLS_BODY, T_LANG, T_LANG_SYS, T_LANG_NEXT, T_FPS, T_FPS_NEXT, T_FPS_SLOW, T_UPSCALE, T_N };
-static const char *const k_text[T_N][2] = {
-    [T_ABOUT] = {"About %@", "關於「%@」"},
-    [T_EDIT_CONTROLS] = {"Edit Controls…", "編輯按鍵…"},
-    [T_HIDE] = {"Hide %@", "隱藏「%@」"},
-    [T_HIDE_OTHERS] = {"Hide Others", "隱藏其他"},
-    [T_SHOW_ALL] = {"Show All", "顯示全部"},
-    [T_QUIT] = {"Quit %@", "結束「%@」"},
-    [T_EDIT] = {"Edit", "編輯"}, [T_UNDO] = {"Undo", "還原"}, [T_REDO] = {"Redo", "重做"},
-    [T_CUT] = {"Cut", "剪下"}, [T_COPY] = {"Copy", "拷貝"}, [T_PASTE] = {"Paste", "貼上"}, [T_SELECT_ALL] = {"Select All", "全選"},
-    [T_GAME] = {"Game", "遊戲"}, [T_PAUSE] = {"Pause", "暫停"}, [T_RESUME] = {"Resume", "繼續"},
-    [T_SHOT] = {"Take Screenshot", "截圖"}, [T_SAVES] = {"Show Saves in Finder", "在 Finder 中顯示存檔"},
-    [T_VIEW] = {"View", "顯示方式"}, [T_FULL] = {"Enter Full Screen", "進入全螢幕"},
-    [T_WINDOW] = {"Window", "視窗"}, [T_MIN] = {"Minimize", "縮到最小"}, [T_ZOOM] = {"Zoom", "縮放"},
-    [T_FRONT] = {"Bring All to Front", "將全部視窗移至最前"},
-    [T_HELP] = {"Help", "輔助說明"}, [T_CONTROLS] = {"Controls", "操作方式"}, [T_LOG] = {"Show Log in Finder", "在 Finder 中顯示記錄檔"},
-    [T_HINT_CLICK] = {"Click the game to control it with the mouse", "點一下畫面即可用滑鼠操作"},
-    [T_HINT_CMD] = {"Press ⌘ to release the mouse", "按 ⌘ 鍵放開滑鼠"},
-    [T_PAUSED] = {"Paused", "已暫停"},
-    [T_QUIT_Q] = {"Quit %@?", "要結束「%@」嗎？"},
-    [T_QUIT_INFO] = {"Progress since your last save will be lost.", "上次存檔之後的進度會遺失。"},
-    [T_QUIT_OK] = {"Quit", "結束"}, [T_OK] = {"OK", "確定"}, [T_CANCEL] = {"Cancel", "取消"},
-    [T_INPUT] = {"Enter Text", "輸入文字"},
-    [T_SHOT_SAVED] = {"Screenshot saved to %@", "截圖已存到「%@」"},
-    [T_SAVE_FAIL] = {"Progress wasn't saved", "進度沒有存到"},
-    [T_SAVE_SPACE] = {"Your Mac is out of storage space. Free up some space and the game will write it the next time it saves.", "Mac 的儲存空間不足。清出一些空間後，遊戲下次存檔時會再寫入。"},
-    [T_SAVE_OTHER] = {"The save file couldn't be written (error %d). The game will try again the next time it saves.", "存檔寫不進去（錯誤 %d）。遊戲下次存檔時會再試。"},
-    [T_LANG] = {"Game Language", "遊戲語言"}, [T_LANG_SYS] = {"Same as Mac", "跟隨 Mac"},
-    [T_LANG_NEXT] = {"The game switches to %@ the next time you open it.", "下次開啟遊戲時會換成%@。"},
-    [T_FPS] = {"Frame Rate", "幀率"}, [T_FPS_NEXT] = {"The game switches to %d FPS the next time you open it.", "下次開啟遊戲時會改成 %d FPS。"},
-    [T_FPS_SLOW] = {"Busy 3D scenes may run below 60 FPS.", "比較複雜的 3D 場景可能跑不滿 60 FPS。"},
-    [T_UPSCALE] = {"MetalFX Upscaling", "MetalFX 放大"},
+       T_SAVE_FAIL, T_SAVE_SPACE, T_SAVE_OTHER, T_CONTROLS_MOUSE, T_CONTROLS_TAP, T_CONTROLS_BODY, T_LANG, T_LANG_SYS, T_LANG_NEXT, T_FPS, T_FPS_NEXT, T_FPS_SLOW, T_UPSCALE,
+       T_DEVICES, T_DIAG, T_DIAG_DONE, T_EXTRAS, T_HANDHELD, T_SHOWFPS, T_N };
+static const char *const k_text[T_N][3] = {
+    [T_ABOUT] = {"About %@", "關於「%@」", "Acerca de %@"},
+    [T_EDIT_CONTROLS] = {"Edit Controls…", "編輯按鍵…", "Controles…"},
+    [T_HIDE] = {"Hide %@", "隱藏「%@」", "Ocultar %@"},
+    [T_HIDE_OTHERS] = {"Hide Others", "隱藏其他", "Ocultar otros"},
+    [T_SHOW_ALL] = {"Show All", "顯示全部", "Mostrar todo"},
+    [T_QUIT] = {"Quit %@", "結束「%@」", "Salir de %@"},
+    [T_EDIT] = {"Edit", "編輯", "Edición"}, [T_UNDO] = {"Undo", "還原", "Deshacer"}, [T_REDO] = {"Redo", "重做", "Rehacer"},
+    [T_CUT] = {"Cut", "剪下", "Cortar"}, [T_COPY] = {"Copy", "拷貝", "Copiar"}, [T_PASTE] = {"Paste", "貼上", "Pegar"}, [T_SELECT_ALL] = {"Select All", "全選", "Seleccionar todo"},
+    [T_GAME] = {"Game", "遊戲", "Juego"}, [T_PAUSE] = {"Pause", "暫停", "Pausa"}, [T_RESUME] = {"Resume", "繼續", "Continuar"},
+    [T_SHOT] = {"Take Screenshot", "截圖", "Hacer captura"}, [T_SAVES] = {"Show Saves in Finder", "在 Finder 中顯示存檔", "Mostrar partidas en Finder"},
+    [T_VIEW] = {"View", "顯示方式", "Visualización"}, [T_FULL] = {"Enter Full Screen", "進入全螢幕", "Pantalla completa"},
+    [T_WINDOW] = {"Window", "視窗", "Ventana"}, [T_MIN] = {"Minimize", "縮到最小", "Minimizar"}, [T_ZOOM] = {"Zoom", "縮放", "Zoom"},
+    [T_FRONT] = {"Bring All to Front", "將全部視窗移至最前", "Traer todo al frente"},
+    [T_HELP] = {"Help", "輔助說明", "Ayuda"}, [T_CONTROLS] = {"Controls", "操作方式", "Cómo se juega"}, [T_LOG] = {"Show Log in Finder", "在 Finder 中顯示記錄檔", "Mostrar registro en Finder"},
+    [T_HINT_CLICK] = {"Click the game to control it with the mouse", "點一下畫面即可用滑鼠操作", "Haz clic en el juego para controlarlo con el ratón"},
+    [T_HINT_CMD] = {"Press ⌘ to release the mouse", "按 ⌘ 鍵放開滑鼠", "Pulsa ⌘ para soltar el ratón"},
+    [T_PAUSED] = {"Paused", "已暫停", "En pausa"},
+    [T_QUIT_Q] = {"Quit %@?", "要結束「%@」嗎？", "¿Salir de %@?"},
+    [T_QUIT_INFO] = {"Progress since your last save will be lost.", "上次存檔之後的進度會遺失。", "Se perderá el progreso desde la última vez que guardaste."},
+    [T_QUIT_OK] = {"Quit", "結束", "Salir"}, [T_OK] = {"OK", "確定", "Aceptar"}, [T_CANCEL] = {"Cancel", "取消", "Cancelar"},
+    [T_INPUT] = {"Enter Text", "輸入文字", "Escribir texto"},
+    [T_SHOT_SAVED] = {"Screenshot saved to %@", "截圖已存到「%@」", "Captura guardada en %@"},
+    [T_SAVE_FAIL] = {"Progress wasn't saved", "進度沒有存到", "No se guardó el progreso"},
+    [T_SAVE_SPACE] = {"Your Mac is out of storage space. Free up some space and the game will write it the next time it saves.", "Mac 的儲存空間不足。清出一些空間後，遊戲下次存檔時會再寫入。", "Tu Mac no tiene espacio suficiente. Libera espacio y el juego lo guardará la próxima vez."},
+    [T_SAVE_OTHER] = {"The save file couldn't be written (error %d). The game will try again the next time it saves.", "存檔寫不進去（錯誤 %d）。遊戲下次存檔時會再試。", "No se pudo escribir la partida (error %d). El juego lo volverá a intentar la próxima vez que guarde."},
+    [T_LANG] = {"Game Language", "遊戲語言", "Idioma del juego"}, [T_LANG_SYS] = {"Same as Mac", "跟隨 Mac", "Igual que el Mac"},
+    [T_LANG_NEXT] = {"The game switches to %@ the next time you open it.", "下次開啟遊戲時會換成%@。", "El juego cambiará a %@ la próxima vez que lo abras."},
+    [T_FPS] = {"Frame Rate", "幀率", "Fotogramas por segundo"}, [T_FPS_NEXT] = {"The game switches to %d FPS the next time you open it.", "下次開啟遊戲時會改成 %d FPS。", "El juego pasará a %d FPS la próxima vez que lo abras."},
+    [T_FPS_SLOW] = {"Busy 3D scenes may run below 60 FPS.", "比較複雜的 3D 場景可能跑不滿 60 FPS。", "Las escenas 3D más cargadas pueden ir por debajo de 60 FPS."},
+    [T_UPSCALE] = {"MetalFX Upscaling", "MetalFX 放大", "Escalado MetalFX"},
+    [T_DEVICES] = {"Input Devices…", "輸入裝置…", "Dispositivos de entrada…"},
+    [T_DIAG] = {"Capture Graphics Diagnostics", "抓圖形診斷", "Capturar diagnóstico gráfico"},
+    [T_DIAG_DONE] = {"Graphics diagnostics saved", "圖形診斷已存好", "Diagnóstico gráfico guardado"},
+    [T_EXTRAS] = {"Extras", "額外", "Extras"},
+    [T_SHOWFPS] = {"Show FPS Counter", "顯示幀率", "Mostrar contador de FPS"},
+    [T_HANDHELD] = {"Handheld Mode (720p, smoother)", "掌機模式（720p，較流暢）", "Modo portátil (720p, más fluido)"},
     // 操作方式的滑鼠那行按左鍵現在的映射選（Pointer = 點哪觸屏哪，否則鎖定推小手），後面接共用的 T_CONTROLS_BODY
     // The mouse line of Controls is picked by the left button's current mapping (Pointer = touch where clicked, otherwise capture and push the hand), followed by the shared T_CONTROLS_BODY
     [T_CONTROLS_MOUSE] = {"Mouse: click the game, then move the mouse to move the hand. Left button A, right button B. Press ⌘ to release the mouse.\n",
-        "滑鼠：先點一下畫面，移動滑鼠就是移動遊戲裡的小手；左鍵 A、右鍵 B。按 ⌘ 鍵放開滑鼠。\n"},
-    [T_CONTROLS_TAP] = {"Mouse: click anywhere to tap the screen there. Right button B.\n", "滑鼠：點畫面上的哪裡，就像用手指點那裡；右鍵 B。\n"},
+        "滑鼠：先點一下畫面，移動滑鼠就是移動遊戲裡的小手；左鍵 A、右鍵 B。按 ⌘ 鍵放開滑鼠。\n", "Ratón: haz clic en el juego y mueve el ratón para mover la mano. Botón izquierdo A, derecho B. Pulsa ⌘ para soltar el ratón.\n"},
+    [T_CONTROLS_TAP] = {"Mouse: click anywhere to tap the screen there. Right button B.\n", "滑鼠：點畫面上的哪裡，就像用手指點那裡；右鍵 B。\n", "Ratón: haz clic donde quieras tocar la pantalla. Botón derecho B.\n"},
     [T_CONTROLS_BODY] = {"Trackpad: two-finger swipe turns the camera. Pinch in for ZL, out for ZR. Three-finger swipe left or right for L / R.\n"
         "Keyboard: W A S D move, P L ; ' turn the camera, J K U I are A B X Y, Q E are L R, Z C are ZL ZR, arrow keys are the D-pad, Return is +, Tab is −.\n"
         "Change any of these with Edit Controls….",
         "觸控板：雙指滑動轉鏡頭，捏合 ZL、張開 ZR，三指左右滑 L / R。\n"
         "鍵盤：W A S D 移動，P L ; ' 轉鏡頭，J K U I 是 A B X Y，Q E 是 L R，Z C 是 ZL ZR，方向鍵是十字鍵，Return 是 +，Tab 是 −。\n"
-        "這些都能在「編輯按鍵…」裡改。"},
+        "這些都能在「編輯按鍵…」裡改。", "Trackpad: desliza con dos dedos para girar la cámara. Pellizca para ZL, separa para ZR. Desliza con tres dedos a izquierda o derecha para L / R.\n"
+        "Teclado: W A S D mueven, P L Ñ ´ giran la cámara, J K U I son A B X Y, Q E son L R, Z C son ZL ZR, las flechas son la cruceta, Retorno es +, Tab es −.\n"
+        "Puedes cambiar los controles del teclado y del mando en Juego → Dispositivos de entrada…"},
 };
-static int ui_lang(void) {   // 0 英文、1 繁體中文（系統首選任何一種中文都用繁體） | 0 English, 1 Traditional Chinese (any Chinese as the system's preferred language gets Traditional)
+static int ui_lang(void) {   // 0 英文、1 繁體中文（系統首選任何一種中文都用繁體）、2 西班牙文 | 0 English, 1 Traditional Chinese (any Chinese as the system's preferred language gets Traditional), 2 Spanish
     static int l = -1; if (l >= 0) return l;
     NSString *p = NSLocale.preferredLanguages.firstObject ?: @"en";
-    return l = [p hasPrefix:@"zh"] || [p hasPrefix:@"yue"] ? 1 : 0;
+    return l = [p hasPrefix:@"zh"] || [p hasPrefix:@"yue"] ? 1 : [p hasPrefix:@"es"] ? 2 : 0;
 }
+int front_ui_lang(void) { return ui_lang(); }
 static NSString *T(int id) { return @(k_text[id][ui_lang()]); }
 static NSString *app_name(void) {
     NSString *n = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleName"];   // 取在地化的值（InfoPlist.strings 裡的完整名稱） | the localized value (the full name in InfoPlist.strings)
@@ -200,10 +216,177 @@ static void input_tick(void) {
     for (int k = 0; k < PU_N; k++) if (g_pu_until[k] && now >= g_pu_until[k]) { g_pu_until[k] = 0; dm_bind_press(g_purow[k], 0); changed = 1; }
     if (changed) dm_bind_publish(dm_input_set);
 }
+// 輸入裝置（遊戲 → 輸入裝置）：0 鍵盤滑鼠和手把都收、1 只收手把、2 只收鍵盤滑鼠；記在 defaults 的 InputMode，切換立即生效
+// Input devices (Game → Input Devices): 0 keyboard, mouse and controller, 1 controller only, 2 keyboard and mouse only; kept as InputMode in the defaults, switching applies at once
+static int input_mode(void) { int m = (int)[NSUserDefaults.standardUserDefaults integerForKey:@"InputMode"]; return m >= 0 && m <= 2 ? m : 0; }
+static int kbd_on(void) { return input_mode() != 1; }
+static int pad_on(void) { return input_mode() != 2; }
 static void input_release_all(void) {
     dm_bind_reset(); memset(g_an_acc, 0, sizeof g_an_acc); memset(g_an_val, 0, sizeof g_an_val); memset(g_pu_until, 0, sizeof g_pu_until);
     dm_bind_publish(dm_input_set); dm_touch_set(NULL, 0);
+    dm_pad_set(0, 0, 0, 0, 0);   // 失焦後系統不再送手柄事件，按著的鍵不會收到「鬆開」 | once focus is lost the system stops sending controller events, so a held button would never see its release
 }
+
+// ---------- 實體手柄（GameController）| Physical controllers (GameController) ----------
+// 走 dm_pad_set，與鍵盤 / 鼠標（dm_input_set）按位或，不經鍵位表。面鍵按鍵帽上的字母對應（dm_padmap.h：Xbox / PS 下方鍵 = A，任天堂手柄照 Switch 原樣）。
+//   多個手柄同時接上時合併成一個；只在窗口在前台時收到事件（系統的缺省）。
+// Goes through dm_pad_set, ORed with keyboard / mouse (dm_input_set), bypassing the keymap. Face buttons map by the letter on the glyph (dm_padmap.h: on Xbox / PS the bottom button = A, Nintendo controllers as on the Switch).
+//   Several connected controllers merge into one; events arrive only while the window is in front (the system default).
+static int32_t pad_axis(float v) { return (int32_t)lrintf(fmaxf(-1.f, fminf(1.f, v)) * DM_STICK_MAX); }
+
+// XInput 手柄（Xbox 360 USB 協議：接口類 255 / 子類 93 / 協議 1）：macOS 沒有這類的驅動，GameController 看不到（如 GameSir 等的 2.4G 接收器）。
+//   用戶態 IOUSBHost 直接開接口、從中斷端點讀 20 字節的報告：[2] 十字鍵 上下左右、Start、Back、L3、R3，[3] LB、RB、Guide、-、A、B、X、Y，[4] [5] LT RT，[6..13] 四軸 int16（上為正）。
+//   鍵帽是 Xbox 佈局，面鍵按 dm_padmap 的 Xbox 對應。報告在完成回調（自己的隊列）裡解析，存進 g_xin，再回主線程由 pads_read 合併。
+// XInput controllers (Xbox 360 USB protocol: interface class 255 / subclass 93 / protocol 1): macOS has no driver for this class, so GameController cannot see them (for example GameSir's 2.4G receivers).
+//   The interface is opened from user space with IOUSBHost and 20-byte reports are read from the interrupt endpoint: [2] D-pad up down left right, Start, Back, L3, R3, [3] LB, RB, Guide, -, A, B, X, Y, [4] [5] LT RT, [6..13] four int16 axes (up positive).
+//   The glyphs are the Xbox layout, so the face buttons use dm_padmap's Xbox mapping. Reports are parsed in the completion handler (on its own queue), stored in g_xin, and merged by pads_read back on the main thread.
+#define XIN_MAX 4
+static struct { IOUSBHostInterface *itf; IOUSBHostPipe *pipe; NSMutableData *buf; NSString *name; uint32_t phys; int32_t ax[4]; } g_xin[XIN_MAX];
+static os_unfair_lock g_xin_lock = OS_UNFAIR_LOCK_INIT;
+static dispatch_queue_t g_xin_q;
+static void pads_read(void);
+static void xin_parse(int i, const uint8_t *r, NSUInteger n) {
+    if (n < 14 || r[0] != 0 || r[1] < 14) return;   // 只認輸入報告（類型 0） | input reports (type 0) only
+    uint8_t b0 = r[2], b1 = r[3]; uint32_t m = 0;
+    static const struct { int byte, bit, to; } k[] = {
+        {0, 0, P_UP}, {0, 1, P_DOWN}, {0, 2, P_LEFT}, {0, 3, P_RIGHT}, {0, 4, P_START}, {0, 5, P_BACK}, {0, 6, P_LS}, {0, 7, P_RS},
+        {1, 0, P_LB}, {1, 1, P_RB}, {1, 4, P_SOUTH}, {1, 5, P_EAST}, {1, 6, P_WEST}, {1, 7, P_NORTH}};
+    for (unsigned j = 0; j < sizeof k / sizeof *k; j++) if (((k[j].byte ? b1 : b0) >> k[j].bit) & 1) m |= 1u << k[j].to;
+    if (r[4] > 64) m |= 1u << P_LT;   // 扳機是模擬量，過四分之一算按下 | the triggers are analogue; past a quarter counts as pressed
+    if (r[5] > 64) m |= 1u << P_RT;
+    int32_t ax[4];
+    for (int a = 0; a < 4; a++) { int v = (int16_t)(r[6 + 2 * a] | r[7 + 2 * a] << 8); ax[a] = abs(v) < 4000 ? 0 : v < -DM_STICK_MAX ? -DM_STICK_MAX : v; }   // 小死區，-32768 夾到 -32767 | small dead zone, -32768 clamped to -32767
+    os_unfair_lock_lock(&g_xin_lock); g_xin[i].phys = m; memcpy(g_xin[i].ax, ax, sizeof ax); os_unfair_lock_unlock(&g_xin_lock);
+    dispatch_async(dispatch_get_main_queue(), ^{ pads_read(); });
+}
+static void xin_drop(int i) {   // 拔掉或讀失敗：關接口、清狀態（在 g_xin_q 上） | unplugged or a read failed: close the interface and clear the state (on g_xin_q)
+    if (!g_xin[i].itf) return;
+    LOG("前端：XInput 手柄 %s 已斷開", g_xin[i].name.UTF8String);
+    [g_xin[i].itf destroy];
+    os_unfair_lock_lock(&g_xin_lock); g_xin[i].itf = nil; g_xin[i].pipe = nil; g_xin[i].buf = nil; g_xin[i].name = nil; g_xin[i].phys = 0; memset(g_xin[i].ax, 0, sizeof g_xin[i].ax); os_unfair_lock_unlock(&g_xin_lock);
+    dispatch_async(dispatch_get_main_queue(), ^{ pads_read(); });
+}
+static void xin_next(int i) {   // 掛下一個讀請求；中斷端點不支持超時，給 0 | queue the next read; interrupt endpoints do not support timeouts, so 0
+    IOUSBHostPipe *p = g_xin[i].pipe; NSMutableData *b = g_xin[i].buf; NSError *e = nil;
+    if (!p || ![p enqueueIORequestWithData:b completionTimeout:0 error:&e completionHandler:^(IOReturn st, NSUInteger n) {
+            if (st != kIOReturnSuccess) { xin_drop(i); return; }
+            xin_parse(i, b.bytes, n); xin_next(i);
+        }]) xin_drop(i);
+}
+static void xin_open(io_service_t svc) {   // 在 g_xin_q 上 | on g_xin_q
+    int i = 0; while (i < XIN_MAX && g_xin[i].itf) i++;
+    if (i == XIN_MAX) return;
+    NSError *e = nil;
+    IOUSBHostInterface *itf = [[IOUSBHostInterface alloc] initWithIOService:svc options:0 queue:g_xin_q error:&e interestHandler:^(IOUSBHostObject *o, uint32_t type, void *arg) {
+        (void)arg; if (type == kIOMessageServiceIsTerminated) for (int j = 0; j < XIN_MAX; j++) if (g_xin[j].itf == o) xin_drop(j); }];
+    if (!itf) { LOG("【紅】前端：XInput 接口打不開：%s", e.localizedDescription.UTF8String); return; }
+    const IOUSBInterfaceDescriptor *d = itf.interfaceDescriptor; const IOUSBEndpointDescriptor *ep = NULL; IOUSBHostPipe *pipe = nil;
+    while (!pipe && (ep = IOUSBGetNextEndpointDescriptor(itf.configurationDescriptor, d, (const IOUSBDescriptorHeader *)ep)))
+        if ((ep->bEndpointAddress & 0x80) && (ep->bmAttributes & 3) == 3) pipe = [itf copyPipeWithAddress:ep->bEndpointAddress error:&e];
+    if (!pipe) { LOG("【紅】前端：XInput 接口沒有中斷輸入端點"); [itf destroy]; return; }
+    NSString *name = CFBridgingRelease(IORegistryEntrySearchCFProperty(svc, kIOServicePlane, CFSTR("USB Product Name"), kCFAllocatorDefault, kIORegistryIterateRecursively | kIORegistryIterateParents)) ?: @"XInput";
+    g_xin[i].itf = itf; g_xin[i].pipe = pipe; g_xin[i].buf = [NSMutableData dataWithLength:32]; g_xin[i].name = name;
+    LOG("前端：XInput 手柄 %s", name.UTF8String);
+    xin_next(i);
+}
+static void xin_matched(void *ref, io_iterator_t it) {
+    (void)ref; io_service_t s;
+    while ((s = IOIteratorNext(it))) { xin_open(s); IOObjectRelease(s); }
+}
+static void xin_watch(void) {
+    g_xin_q = dispatch_queue_create("dm.xinput", DISPATCH_QUEUE_SERIAL);
+    IONotificationPortRef port = IONotificationPortCreate(kIOMainPortDefault); IONotificationPortSetDispatchQueue(port, g_xin_q);
+    // 按接口類 / 子類 / 協議比對（IOPropertyMatch；直接寫在頂層的 bInterface* 鍵比不上） | match on interface class / subclass / protocol (IOPropertyMatch; bInterface* keys at the top level do not match)
+    NSDictionary *match = @{@kIOProviderClassKey: @"IOUSBHostInterface", @kIOPropertyMatchKey: @{@"bInterfaceClass": @255, @"bInterfaceSubClass": @93, @"bInterfaceProtocol": @1}};
+    io_iterator_t it;
+    if (IOServiceAddMatchingNotification(port, kIOFirstMatchNotification, (CFDictionaryRef)CFBridgingRetain(match), xin_matched, NULL, &it) == KERN_SUCCESS)
+        dispatch_async(g_xin_q, ^{ xin_matched(NULL, it); });   // 已經接著的先開一遍，同時武裝通知 | open the ones already connected, which also arms the notification
+}
+NSArray<NSString *> *front_pad_names(void);
+static NSArray<NSString *> *xin_names(void) {
+    NSMutableArray<NSString *> *a = [NSMutableArray array];
+    os_unfair_lock_lock(&g_xin_lock); for (int i = 0; i < XIN_MAX; i++) if (g_xin[i].itf) [a addObject:g_xin[i].name]; os_unfair_lock_unlock(&g_xin_lock);
+    return a;
+}
+
+// 手柄鍵位：實體鍵（P_*，按位置）→ Switch 鍵。玩家在「控制」窗口改過就用 defaults 的 PadMap（16 個數：每個 Switch 鍵對應的實體鍵，-1 = 不映射），
+//   沒改過就按手柄類型：Xbox / PS 下方鍵 = A，任天堂手柄照 Switch 原樣（dm_padmap.h）
+// Controller mapping: physical buttons (P_*, by position) → Switch buttons. Once the player changes it in the Controls window, PadMap in the defaults is used (16 numbers: the physical button for each Switch button, -1 = unmapped);
+//   otherwise it follows the controller type: on Xbox / PS the bottom button = A, Nintendo controllers as on the Switch (dm_padmap.h)
+static int g_padmap[16], g_padmap_custom;
+static const int k_pad_xbox[16] = {P_SOUTH, P_EAST, P_WEST, P_NORTH, P_LS, P_RS, P_LB, P_RB, P_LT, P_RT, P_START, P_BACK, P_LEFT, P_UP, P_RIGHT, P_DOWN};
+static const int k_pad_nintendo[16] = {P_EAST, P_SOUTH, P_NORTH, P_WEST, P_LS, P_RS, P_LB, P_RB, P_LT, P_RT, P_START, P_BACK, P_LEFT, P_UP, P_RIGHT, P_DOWN};
+static void padmap_load(void) {
+    NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:@"PadMap"];
+    g_padmap_custom = a.count == 16;
+    for (int s = 0; s < 16; s++) g_padmap[s] = g_padmap_custom ? [a[s] intValue] : k_pad_xbox[s];
+}
+static uint64_t pad_map(uint32_t phys, int kind) {
+    const int *t = g_padmap_custom ? g_padmap : kind == DM_PADKIND_NINTENDO ? k_pad_nintendo : k_pad_xbox; uint64_t m = 0;
+    for (int s = 0; s < 16; s++) if (t[s] >= 0 && t[s] < P_N && (phys >> t[s] & 1)) m |= 1ull << s;
+    return m;
+}
+void front_padmap_get(int map[16], int *custom) { memcpy(map, g_padmap, sizeof g_padmap); if (custom) *custom = g_padmap_custom; }
+void front_padmap_set(const int *map) {
+    if (map) { NSMutableArray *a = [NSMutableArray array]; for (int s = 0; s < 16; s++) [a addObject:@(map[s])]; [NSUserDefaults.standardUserDefaults setObject:a forKey:@"PadMap"]; }
+    else [NSUserDefaults.standardUserDefaults removeObjectForKey:@"PadMap"];
+    padmap_load(); pads_read();
+}
+static void pads_read(void) {
+    uint64_t m = 0; uint32_t raw = 0; int32_t ax[4] = {0};
+    os_unfair_lock_lock(&g_xin_lock);
+    for (int i = 0; i < XIN_MAX; i++) if (g_xin[i].itf) {
+        m |= pad_map(g_xin[i].phys, DM_PADKIND_XBOX); raw |= g_xin[i].phys;
+        for (int a = 0; a < 4; a++) if (abs(g_xin[i].ax[a]) > abs(ax[a])) ax[a] = g_xin[i].ax[a];
+    }
+    os_unfair_lock_unlock(&g_xin_lock);
+    for (GCController *c in GCController.controllers) {
+        GCExtendedGamepad *g = c.extendedGamepad; if (!g) continue;
+        int kind = dm_padmap_kind(c.productCategory.UTF8String, c.vendorName.UTF8String);
+        uint32_t phys = 0;   // GameController 的面鍵按位置：buttonA 下、buttonB 右、buttonX 左、buttonY 上 | GameController face buttons are positional: buttonA bottom, buttonB right, buttonX left, buttonY top
+        #define K(btn, p) if ((btn) && (btn).isPressed) phys |= 1u << p
+        K(g.buttonA, P_SOUTH); K(g.buttonB, P_EAST); K(g.buttonX, P_WEST); K(g.buttonY, P_NORTH);
+        K(g.leftShoulder, P_LB); K(g.rightShoulder, P_RB); K(g.leftTrigger, P_LT); K(g.rightTrigger, P_RT);
+        K(g.buttonMenu, P_START); K(g.buttonOptions, P_BACK); K(g.leftThumbstickButton, P_LS); K(g.rightThumbstickButton, P_RS);
+        K(g.dpad.left, P_LEFT); K(g.dpad.up, P_UP); K(g.dpad.right, P_RIGHT); K(g.dpad.down, P_DOWN);
+        #undef K
+        m |= pad_map(phys, kind); raw |= phys;
+        float v[4] = {g.leftThumbstick.xAxis.value, g.leftThumbstick.yAxis.value, g.rightThumbstick.xAxis.value, g.rightThumbstick.yAxis.value};
+        for (int i = 0; i < 4; i++) if (fabsf(v[i]) > fabsf(ax[i] / (float)DM_STICK_MAX)) ax[i] = pad_axis(v[i]);   // 多個手柄：取推得最遠的 | several controllers: the furthest tilt wins
+    }
+    static uint32_t last_raw; if (raw != last_raw) { last_raw = raw; controls_pad_phys(raw); }   // 控制窗口錄鍵用（不管遊戲窗口在不在前台） | for button capture in the Controls window (whether or not the game window is in front)
+    if (!pad_on() || !g_win.isKeyWindow) { m = 0; memset(ax, 0, sizeof ax); }   // XInput 在後台也照樣送報告；只在窗口在前台時算 | XInput reports keep coming in the background; count them only while the window is in front
+    dm_pad_set(m, ax[0], ax[1], ax[2], ax[3]);   // 上為正，與 GameController 相同 | up is positive, as in GameController
+}
+static void pads_changed(void) {
+    for (GCController *c in GCController.controllers) {
+        if (!c.extendedGamepad) continue;
+        c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)g; (void)el; pads_read(); };
+        LOG("前端：手柄 %s（%s）", c.vendorName.UTF8String ?: "?", c.productCategory.UTF8String ?: "?");
+    }
+    pads_read();
+}
+static void pads_watch(void) {
+    for (NSNotificationName n in @[GCControllerDidConnectNotification, GCControllerDidDisconnectNotification])
+        [NSNotificationCenter.defaultCenter addObserverForName:n object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *x) { (void)x; pads_changed(); }];
+    padmap_load(); pads_changed(); xin_watch();
+}
+// ---- 給控制窗口（controls_mac.m）的接口 | Interface for the Controls window (controls_mac.m) ----
+NSArray<NSString *> *front_pad_names(void) {
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (GCController *c in GCController.controllers) if (c.extendedGamepad) [names addObject:c.vendorName ?: c.productCategory ?: @"?"];
+    [names addObjectsFromArray:xin_names()];
+    return names;
+}
+int front_input_mode(void) { return input_mode(); }
+void front_input_mode_set(int m) {
+    if (m) [NSUserDefaults.standardUserDefaults setInteger:m forKey:@"InputMode"]; else [NSUserDefaults.standardUserDefaults removeObjectForKey:@"InputMode"];
+    input_release_all(); pads_read();   // 先全部鬆開，再按新設定重讀手把 | release everything, then reread the controllers under the new setting
+}
+const char *front_keymap_path(void) { return g_keymap_path[0] ? g_keymap_path : NULL; }
+const char *front_keymap_defaults(void) { return k_default_map; }
+const char *front_keyname(int code) { return code >= 0 && code < 128 ? k_keyname[code] : NULL; }
+void front_keymap_apply(void) { input_release_all(); keymap_load(); LOG("前端：控制窗口改了鍵位，已重讀 %s", g_keymap_path); }
 static void on_key(NSEvent *e, int down) {
     unsigned short c = e.keyCode; if (c >= 128 || g_keyrow[c] < 0) return;
     dm_bind_press(g_keyrow[c], down); dm_bind_publish(dm_input_set);
@@ -231,6 +414,29 @@ static void hint_update(void) {
     if (g_flash && CACurrentMediaTime() < g_flash_until) { g_win.subtitle = g_flash; return; }
     g_flash = nil;
     g_win.subtitle = g_paused ? T(T_PAUSED) : g_captured ? T(T_HINT_CMD) : capture_wanted() ? T(T_HINT_CLICK) : @"";
+}
+// 幀率計數：遊戲畫面左上角的小標籤，每 0.5 秒按實際出圖次數（mtl_present_count）算一次 FPS 與平均幀時間；開關記進 defaults 的 ShowFPS
+// FPS counter: a small label in the top-left corner of the game picture, recomputed every 0.5 s from the actual present count (mtl_present_count) as FPS and average frame time; the switch is stored as ShowFPS in the defaults
+uint64_t mtl_present_count(void);
+static CATextLayer *g_fps_layer; static NSTimer *g_fps_timer;
+static int fpsc_pref(void) { return [NSUserDefaults.standardUserDefaults boolForKey:@"ShowFPS"]; }
+static void fps_show(int on) {
+    if (!on) { [g_fps_timer invalidate]; g_fps_timer = nil; [g_fps_layer removeFromSuperlayer]; g_fps_layer = nil; return; }
+    if (g_fps_layer || !g_view.layer) return;
+    CATextLayer *t = [CATextLayer layer];
+    t.font = (__bridge CFTypeRef)[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold]; t.fontSize = 13;
+    t.foregroundColor = NSColor.whiteColor.CGColor; t.backgroundColor = [NSColor colorWithWhite:0 alpha:0.55].CGColor;
+    t.cornerRadius = 5; t.alignmentMode = kCAAlignmentCenter; t.contentsScale = g_win.backingScaleFactor; t.zPosition = 10; t.string = @"— FPS";
+    [g_view.layer addSublayer:t]; g_fps_layer = t;
+    __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
+    void (^place)(void) = ^{ CGRect b = g_view.layer.bounds; [CATransaction begin]; [CATransaction setDisableActions:YES];
+        g_fps_layer.frame = CGRectMake(8, b.size.height - 8 - 22, 132, 22); g_fps_layer.contentsScale = g_win.backingScaleFactor; [CATransaction commit]; };
+    place();
+    g_fps_timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *tm) { (void)tm;
+        uint64_t n = mtl_present_count(); double now = CACurrentMediaTime(), fps = (now > t0) ? (double)(n - n0) / (now - t0) : 0; n0 = n; t0 = now;
+        [CATransaction begin]; [CATransaction setDisableActions:YES];
+        g_fps_layer.string = fps > 0.5 ? [NSString stringWithFormat:@"%.0f FPS · %.1f ms", fps, 1000.0 / fps] : @"0 FPS";
+        [CATransaction commit]; place(); }];
 }
 static void flash(NSString *s) {
     g_flash = s; g_flash_until = CACurrentMediaTime() + 3; hint_update();
@@ -312,17 +518,24 @@ static int upscale_pref(void) { id v = [NSUserDefaults.standardUserDefaults obje
     dm_gfx_shot_at(0, url.fileSystemRepresentation);
     flash([NSString stringWithFormat:T(T_SHOT_SAVED), [NSFileManager.defaultManager displayNameAtPath:dir.path]]);
 }
-- (void)editControls:(id)sender {
-    (void)sender; if (!g_keymap_path[0]) return;
-    if (access(g_keymap_path, F_OK)) { FILE *f = fopen(g_keymap_path, "w"); if (f) { fputs("# key:J A  …  see the Controls page in Help\n", f); fclose(f); } }
-    [NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:@(g_keymap_path)]];
-}
+- (void)editControls:(id)sender { (void)sender; capture_set(0); controls_open(); }   // 控制窗口（controls_mac.m） | the Controls window (controls_mac.m)
 - (void)setFrameRate:(NSMenuItem *)it {
     int fps = (int)it.tag; if (fps == fps_pref()) return;
     if (fps == 60) [NSUserDefaults.standardUserDefaults setInteger:60 forKey:@"FrameRate"]; else [NSUserDefaults.standardUserDefaults removeObjectForKey:@"FrameRate"];
     capture_set(0);
     NSAlert *a = [NSAlert new]; a.messageText = [NSString stringWithFormat:T(T_FPS_NEXT), fps]; if (fps == 60) a.informativeText = T(T_FPS_SLOW); [a addButtonWithTitle:T(T_OK)];
     if (g_win.attachedSheet) [a runModal]; else [a beginSheetModalForWindow:g_win completionHandler:nil];
+}
+// 掌機模式：遊戲按 720p 渲染（主機模式 1080p），GPU 像素少一半多；即時切換（hle_oe.c dm_set_opmode 推運行模式通知），記進 defaults 供啓動腳本讀
+// Handheld mode: the game renders at 720p (1080p in console mode), less than half the GPU pixels; switched live (hle_oe.c dm_set_opmode pushes the operation-mode notification) and stored in the defaults for the launch script
+- (void)toggleFPS:(NSMenuItem *)it {
+    (void)it; int on = !fpsc_pref();
+    [NSUserDefaults.standardUserDefaults setBool:on forKey:@"ShowFPS"]; fps_show(on);
+}
+- (void)toggleHandheld:(NSMenuItem *)it {
+    (void)it; int on = dm_opmode() != 0;
+    [NSUserDefaults.standardUserDefaults setBool:on forKey:@"Handheld"]; dm_set_opmode(on ? 0 : 1);
+    LOG("前端：掌機模式%s", on ? "開" : "關");
 }
 - (void)toggleUpscale:(NSMenuItem *)it {
     (void)it; int on = !upscale_pref();
@@ -338,6 +551,24 @@ static int upscale_pref(void) { id v = [NSUserDefaults.standardUserDefaults obje
     NSAlert *a = [NSAlert new]; a.messageText = [NSString stringWithFormat:T(T_LANG_NEXT), k_langs[i].name ? @(k_langs[i].name) : T(T_LANG_SYS)]; [a addButtonWithTitle:T(T_OK)];
     if (g_win.attachedSheet) [a runModal]; else [a beginSheetModalForWindow:g_win completionHandler:nil];
 }
+// 抓圖形診斷：本幀截圖 + 兩幀後的通道轉儲與顏色目標，存到日誌文件夾下的 diag-<時間>/（nvn_diag_capture） | capture graphics diagnostics: a screenshot of this frame plus the pass dump and colour targets two frames later, into diag-<time>/ under the log folder (nvn_diag_capture)
+void nvn_diag_capture(const char *path_fmt);
+- (void)captureDiag:(id)sender {
+    (void)sender; if (g_paused) return;
+    NSDateFormatter *f = [NSDateFormatter new]; f.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *dir = [[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/nxnative"] stringByAppendingPathComponent:[@"diag-" stringByAppendingString:[f stringFromDate:NSDate.date]]];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    dm_gfx_shot_at(0, [dir stringByAppendingPathComponent:@"pantalla.png"].fileSystemRepresentation);
+    nvn_diag_capture([dir stringByAppendingPathComponent:@"rt_%d.png"].fileSystemRepresentation);
+    LOG("前端：圖形診斷 → %s", dir.UTF8String);
+    // 轉儲寫完後把日誌拷進同一個文件夾：下次開遊戲日誌會被重寫 | once the dump is written, copy the log into the same folder: the next launch rewrites the log
+    NSString *log = log_path();
+    if (log) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [NSFileManager.defaultManager copyItemAtPath:log toPath:[dir stringByAppendingPathComponent:@"registro.log"] error:nil]; });
+    flash(T(T_DIAG_DONE));
+}
+- (void)showAlbum:(id)sender { (void)sender; album_open(); }
+- (void)showAlbumFolder:(id)sender { (void)sender; album_show_folder(); }
 - (void)showSaves:(id)sender { (void)sender; const char *s = getenv("DM_SAVE"); if (s) [NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:@(s) isDirectory:YES]]; }
 - (void)showLog:(id)sender { (void)sender; NSString *p = log_path(); if (p) [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:p]]]; }
 - (void)showControls:(id)sender {
@@ -361,9 +592,10 @@ static int upscale_pref(void) { id v = [NSUserDefaults.standardUserDefaults obje
     if (a == @selector(togglePause:)) { it.title = g_paused ? T(T_RESUME) : T(T_PAUSE); return !g_win.miniaturized; }
     if (a == @selector(takeScreenshot:)) return !g_paused && !g_win.miniaturized;
     if (a == @selector(setGameSize:)) { NSSize c = g_view.bounds.size; it.state = !fs && fabs(c.width - it.tag) < 1 ? NSControlStateValueOn : NSControlStateValueOff; return !fs && !g_win.miniaturized; }
-    if (a == @selector(editControls:)) return g_keymap_path[0] != 0;
     if (a == @selector(showSaves:)) return getenv("DM_SAVE") != NULL;
     if (a == @selector(setFrameRate:)) { it.state = it.tag == fps_pref() ? NSControlStateValueOn : NSControlStateValueOff; return YES; }
+    if (a == @selector(toggleFPS:)) { it.state = fpsc_pref() ? NSControlStateValueOn : NSControlStateValueOff; return YES; }
+    if (a == @selector(toggleHandheld:)) { it.state = dm_opmode() == 0 ? NSControlStateValueOn : NSControlStateValueOff; return YES; }
     if (a == @selector(toggleUpscale:)) { it.state = upscale_pref() ? NSControlStateValueOn : NSControlStateValueOff; return YES; }
     if (a == @selector(setGameLanguage:)) { it.state = [@(k_langs[it.tag].code) isEqualToString:lang_pref()] ? NSControlStateValueOn : NSControlStateValueOff; return YES; }
     if (a == @selector(showLog:)) return log_path() != nil;
@@ -428,6 +660,9 @@ static void menus_build(void) {
         item_add(fps, @"30 FPS", @selector(setFrameRate:), nil, 0, g_app).tag = 30;
         item_add(fps, @"60 FPS", @selector(setFrameRate:), nil, 0, g_app).tag = 60;
     }
+    item_add(game, T(T_HANDHELD), @selector(toggleHandheld:), nil, 0, g_app);
+    item_add(game, T(T_SHOWFPS), @selector(toggleFPS:), @"f", CMD | NSEventModifierFlagOption, g_app);
+    item_add(game, T(T_DEVICES), @selector(editControls:), nil, 0, g_app);
     NSMenu *view = menu_add(bar, T(T_VIEW));
     static const int widths[3] = {960, 1280, 1600};
     NSSize p = picture_size();
@@ -436,6 +671,9 @@ static void menus_build(void) {
     item_add(view, T(T_FULL), @selector(toggleFullScreen:), @"f", CMD | NSEventModifierFlagControl, nil);
     [view addItem:NSMenuItem.separatorItem];
     item_add(view, T(T_UPSCALE), @selector(toggleUpscale:), nil, 0, g_app);
+    NSMenu *ext = menu_add(bar, T(T_EXTRAS));   // 遊戲內存進相簿的照片（album_mac.m） | photos the game saved to its album (album_mac.m)
+    item_add(ext, [@(album_title(0)) stringByAppendingString:@"…"], @selector(showAlbum:), @"e", CMD | NSEventModifierFlagShift, g_app);
+    item_add(ext, @(album_title(1)), @selector(showAlbumFolder:), nil, 0, g_app);
     NSMenu *win = menu_add(bar, T(T_WINDOW));
     item_add(win, T(T_MIN), @selector(performMiniaturize:), @"m", CMD, nil);
     item_add(win, T(T_ZOOM), @selector(performZoom:), nil, 0, nil);
@@ -444,6 +682,7 @@ static void menus_build(void) {
     NSMenu *help = menu_add(bar, T(T_HELP));
     item_add(help, T(T_CONTROLS), @selector(showControls:), @"?", CMD, g_app);
     item_add(help, T(T_LOG), @selector(showLog:), nil, 0, g_app);
+    item_add(help, T(T_DIAG), @selector(captureDiag:), @"d", CMD | NSEventModifierFlagOption | NSEventModifierFlagShift, g_app);
     NSApp.mainMenu = bar; NSApp.windowsMenu = win; NSApp.helpMenu = help;
 }
 
@@ -487,6 +726,7 @@ void front_run(void (*guest)(void)) {
         [win makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
         hint_update();
+        if (fpsc_pref()) fps_show(1);
         // 鍵盤：⌘ 組合鍵交給菜單；按下 ⌘ 放開鼠標；沒映射的 Esc 也放開 | Keyboard: ⌘ combinations go to the menus; pressing ⌘ releases the mouse; an unmapped Esc releases it too
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskFlagsChanged handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // 只吃遊戲窗口的鍵；軟鍵盤輸入框等其他窗口照常收字 | Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
@@ -495,7 +735,7 @@ void front_run(void (*guest)(void)) {
             if (!down) { on_key(e, 0); return nil; }   // 抬起一律送到：⌘ 期間按下的遊戲鍵也能鬆開 | key-ups always go through, so game keys pressed around ⌘ still get released
             if (e.modifierFlags & NSEventModifierFlagCommand) return e;
             if (e.keyCode == KC_ESCAPE && g_keyrow[KC_ESCAPE] < 0) { capture_set(0); return nil; }
-            if (!g_paused && !e.isARepeat) on_key(e, 1);
+            if (!g_paused && !e.isARepeat && kbd_on()) on_key(e, 1);
             return nil;   // 吃掉，免得系統提示音 | Swallow it to avoid the system beep
         }];
         // 鼠標：映射到 Pointer 的鍵在鼠標處觸屏（拖動跟著走，鬆開抬起）；其餘沒鎖定時歸系統，在畫面上點一下鎖定，鎖定後按鍵按映射表、移動累積成 mouse:Move
@@ -513,7 +753,7 @@ void front_run(void (*guest)(void)) {
             int up = ty == NSEventTypeLeftMouseUp || ty == NSEventTypeRightMouseUp || ty == NSEventTypeOtherMouseUp;
             NSPoint p = [v convertPoint:e.locationInWindow fromView:nil];
             int inside = NSPointInRect(p, v.bounds);   // 標題欄、窗口邊不算 | the title bar and window edges do not count
-            if (g_paused) return inside ? nil : e;
+            if (g_paused || !kbd_on()) return inside ? nil : e;
             if (b >= 0 && dm_bind_is_pointer(g_mbrow[b])) {
                 if (up) { dm_touch_set(NULL, 0); return nil; }
                 if (!inside) return e;
@@ -532,7 +772,7 @@ void front_run(void (*guest)(void)) {
         // 觸控板：雙指滾動（滾輪也算）、旋轉、捏合、三指滑 | Trackpad: two-finger scroll (the wheel counts too), rotate, pinch, three-finger swipe
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskScrollWheel | NSEventMaskRotate | NSEventMaskMagnify | NSEventMaskSwipe handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;
-            if (g_paused) return nil;
+            if (g_paused || !kbd_on()) return nil;
             switch (e.type) {
                 case NSEventTypeScrollWheel: {   // 按手指方向：自然滾動時增量即手指方向，否則反過來；滾輪一格按 10 點算 | by finger direction: with natural scrolling the delta is the finger direction, otherwise reversed; a wheel notch counts as 10 points
                     float k = e.hasPreciseScrollingDeltas ? 1.f : 10.f, sx = (float)e.scrollingDeltaX * k, sy = (float)e.scrollingDeltaY * k;
@@ -546,6 +786,7 @@ void front_run(void (*guest)(void)) {
             return nil;
         }];
         [NSTimer scheduledTimerWithTimeInterval:1.0 / 60 repeats:YES block:^(NSTimer *tm) { (void)tm; input_tick(); }];
+        pads_watch();
         // 生命週期（hle.h / dm.h）：失焦 → 2、拿回焦點 → 1；最小化 → 3 + 音頻暫停 + GPU 掛起，還原 → 恢復（隨後拿回焦點 → 1）；暫停中這兩樣由暫停管
         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1); while paused the pause owns those two
         [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; capture_set(0); input_release_all(); if (!win.miniaturized) dm_focus_set(2); }];
@@ -553,6 +794,7 @@ void front_run(void (*guest)(void)) {
             (void)n;
             if (keymap_changed()) { input_release_all(); keymap_load(); LOG("前端：鍵位表改過，已重讀 %s", g_keymap_path); }
             if (!g_paused) dm_focus_set(1);
+            pads_read();   // 失焦時清掉了手柄狀態，按回當前的 | the controller state was cleared on focus loss; put back the current one
             hint_update();
         }];
         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; capture_set(0); if (!g_paused) { dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); } }];
